@@ -1,8 +1,5 @@
 {
   "_name_or_path": "/home/kade/toolkit/diffusion/comfy/models/unet/chroma-unlocked-v29.5.safetensors",
-  "architectures": [
-    "ChromaTransformer2DModel"
-  ],
   "patch_size": 1,
   "in_channels": 64,
   "out_channels": 64,

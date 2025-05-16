@@ -891,11 +891,16 @@ class ChromaTransformer2DModel(
         return_dict: bool = True,
     ) -> Union[torch.Tensor, Transformer2DModelOutput]:
 
-        batch_size, seq_len_img, _ = hidden_states.shape
-        seq_len_txt = encoder_hidden_states.shape[1]
+        batch_size_cfg = hidden_states.shape[0]
+        current_dtype = hidden_states.dtype  # Match mask dtype to hidden_states
+        current_device = hidden_states.device
 
-        img_embeds = self.img_in(hidden_states)
-        txt_embeds = self.txt_in(encoder_hidden_states)
+        img_embeds = self.img_in(hidden_states.to(self.img_in.weight.dtype))
+        # Ensure encoder_hidden_states matches the dtype of the txt_in layer's weights
+        txt_embeds = self.txt_in(encoder_hidden_states.to(self.txt_in.weight.dtype))
+
+        seq_len_img = img_embeds.shape[1]
+        seq_len_txt = txt_embeds.shape[1]
 
         # Approximator - flow model uses torch.no_grad() context here.
         # For basic inference/usage in Diffusers, we typically don't manage grad contexts inside the model.
@@ -910,7 +915,7 @@ class ChromaTransformer2DModel(
 
         if txt_ids.shape[-1] < img_ids.shape[-1]:
             padding = torch.zeros(
-                batch_size,
+                batch_size_cfg,
                 seq_len_txt,
                 img_ids.shape[-1] - txt_ids.shape[-1],
                 device=txt_ids.device,
@@ -921,7 +926,7 @@ class ChromaTransformer2DModel(
             img_ids.shape[-1] < txt_ids.shape[-1]
         ):  # Handle case where img_ids might be simpler
             padding = torch.zeros(
-                batch_size,
+                batch_size_cfg,
                 seq_len_img,
                 txt_ids.shape[-1] - img_ids.shape[-1],
                 device=img_ids.device,
@@ -945,13 +950,13 @@ class ChromaTransformer2DModel(
         # Default: allow all attention if no text mask provided
         seq_len_all = seq_len_txt + seq_len_img
         txt_img_mask_for_sdpa = torch.zeros(
-            batch_size, 1, seq_len_all, seq_len_all, device=img_embeds.device
+            batch_size_cfg, 1, seq_len_all, seq_len_all, device=current_device
         )
 
         if attention_mask is not None:  # tokenizer mask (B, L_txt), 1=attend, 0=pad
             # Get text-only square mask (B, L_txt, L_txt) with SDPA format
             text_square_sdpa_mask = self._get_text_attention_mask(
-                attention_mask, num_tokens_to_unmask_pad, img_embeds.device
+                attention_mask, num_tokens_to_unmask_pad, current_device
             )
 
             # Combine for full sequence for SDPA: (B, 1, L_all, L_all)
@@ -972,7 +977,7 @@ class ChromaTransformer2DModel(
             # For flow's M_qk = m_q * m_k logic, where m is the (L_all) combined mask vector:
 
             modified_txt_mask_flat = attention_mask.clone()  # (B, L_txt)
-            for i in range(batch_size):
+            for i in range(batch_size_cfg):
                 current_len = int(attention_mask[i].sum().item())
                 if num_tokens_to_unmask_pad > 0 and current_len < seq_len_txt:
                     can_unmask = min(
@@ -983,9 +988,9 @@ class ChromaTransformer2DModel(
                     ] = 1
 
             img_mask_flat = torch.ones(
-                batch_size,
+                batch_size_cfg,
                 seq_len_img,
-                device=img_embeds.device,
+                device=current_device,
                 dtype=modified_txt_mask_flat.dtype,
             )
             combined_m_vector = torch.cat(
@@ -996,9 +1001,9 @@ class ChromaTransformer2DModel(
             # Mask is (B, L_q, L_k). Entry (b,q,k) is 0 if attend, -inf if not.
             l_all = seq_len_all
             flow_style_mask = torch.zeros(
-                batch_size, l_all, l_all, device=img_embeds.device
+                batch_size_cfg, l_all, l_all, device=current_device
             )
-            for b_idx in range(batch_size):
+            for b_idx in range(batch_size_cfg):
                 m_b = combined_m_vector[b_idx].float()  # (L_all)
                 square_logic = m_b.unsqueeze(1) * m_b.unsqueeze(0)  # (L_all, L_all)
                 flow_style_mask[b_idx] = torch.where(
