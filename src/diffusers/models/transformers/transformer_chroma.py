@@ -86,14 +86,14 @@ class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
+        self.scale = nn.Parameter(torch.ones(dim))
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
         output = self._norm(x.float()).type_as(x)
-        return output * self.weight
+        return output * self.scale
 
 
 class ChromaRoPE(nn.Module):
@@ -381,7 +381,7 @@ class ChromaMLPEmbedder(nn.Module):
 
 
 class ChromaApproximator(nn.Module):
-    def __init__(self, config):  # config will be ChromaTransformer2DConfig
+    def __init__(self, config):
         super().__init__()
         self.config = config
         self.in_dim_approximator = sum(config.approximator_in_dim_feature_splits)
@@ -509,14 +509,9 @@ class ChromaDoubleStreamBlock(nn.Module):
         # Our ChromaSelfAttention has q_proj, k_proj, v_proj, out_proj and norm_q, norm_k (RMS)
         # We need to make sure this maps correctly.
         # flow.DoubleStreamBlock creates img_qkv, then img_q,k,v, then norms q,k with SelfAttention.norm
-        self.img_attn_qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.img_attn_qknorm = RMSNorm(
-            head_dim, eps=1e-6
-        )  # Assuming QKNorm applies to each head separately
-        # flow.QKNorm is RMSNorm(dim) but applied to Q,K of shape (B,H,L,D_head)
-        # So it should be RMSNorm(head_dim)
-        self.img_attn_proj = nn.Linear(dim, dim)
-
+        self.img_attn = ChromaSelfAttention(
+            dim, num_heads, head_dim, qk_norm=True, eps=1e-6
+        )
         self.img_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.img_mlp = nn.Sequential(
             nn.Linear(dim, mlp_hidden_dim, bias=True),
@@ -526,10 +521,9 @@ class ChromaDoubleStreamBlock(nn.Module):
 
         # Text Stream Components
         self.txt_norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.txt_attn_qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.txt_attn_qknorm = RMSNorm(head_dim, eps=1e-6)
-        self.txt_attn_proj = nn.Linear(dim, dim)
-
+        self.txt_attn = ChromaSelfAttention(
+            dim, num_heads, head_dim, qk_norm=True, eps=1e-6
+        )
         self.txt_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.txt_mlp = nn.Sequential(
             nn.Linear(dim, mlp_hidden_dim, bias=True),
@@ -562,84 +556,39 @@ class ChromaDoubleStreamBlock(nn.Module):
         normed_tensor = norm_layer(reshaped_tensor)
         return normed_tensor.reshape(b, h, l, d).to(orig_dtype)
 
-    def forward(self, img_embeds, txt_embeds, pe_freqs_cis, mod_dict_entry, mask):
+    def forward(
+        self,
+        img_embeds,
+        txt_embeds,
+        pe_freqs_cis_img,
+        pe_freqs_cis_txt,
+        mod_dict_entry,
+        mask_img,
+        mask_txt,
+    ):
         img_mod_attn, img_mod_mlp = mod_dict_entry["img_mod.lin"]
         txt_mod_attn, txt_mod_mlp = mod_dict_entry["txt_mod.lin"]
 
         # Image Path - QKV generation and Norm
         img_norm1_out = self.img_norm1(img_embeds)
-        img_modulated_attn = self._modulate(img_norm1_out, img_mod_attn)
-        img_qkv_proj = self.img_attn_qkv(img_modulated_attn)
-        img_q, img_k, img_v = rearrange(
-            img_qkv_proj,
-            "b l (k h d) -> k b h l d",
-            k=3,
-            h=self.num_heads,
-            d=self.head_dim,
-        ).unbind(0)
-        img_q = self._apply_norm_to_q_or_k(img_q, self.img_attn_qknorm)
-        img_k = self._apply_norm_to_q_or_k(img_k, self.img_attn_qknorm)
+        img_modulated_attn_in = self._modulate(img_norm1_out, img_mod_attn)
+        img_attn_res = self.img_attn(img_modulated_attn_in, pe_freqs_cis_img, mask_img)
+        img_embeds = img_embeds + img_mod_attn.gate.squeeze(1) * img_attn_res
+
+        img_norm2_out = self.img_norm2(img_embeds)
+        img_modulated_mlp_in = self._modulate(img_norm2_out, img_mod_mlp)
+        img_mlp_processed = self.img_mlp(img_modulated_mlp_in)
+        img_embeds = img_embeds + img_mod_mlp.gate.squeeze(1) * img_mlp_processed
 
         # Text Path - QKV generation and Norm
         txt_norm1_out = self.txt_norm1(txt_embeds)
-        txt_modulated_attn = self._modulate(txt_norm1_out, txt_mod_attn)
-        txt_qkv_proj = self.txt_attn_qkv(txt_modulated_attn)
-        txt_q, txt_k, txt_v = rearrange(
-            txt_qkv_proj,
-            "b l (k h d) -> k b h l d",
-            k=3,
-            h=self.num_heads,
-            d=self.head_dim,
-        ).unbind(0)
-        txt_q = self._apply_norm_to_q_or_k(txt_q, self.txt_attn_qknorm)
-        txt_k = self._apply_norm_to_q_or_k(txt_k, self.txt_attn_qknorm)
-
-        # Shared Attention
-        q_shared = torch.cat((txt_q, img_q), dim=2)
-        k_shared = torch.cat((txt_k, img_k), dim=2)
-        v_shared = torch.cat((txt_v, img_v), dim=2)
-
-        q_shared_rope, k_shared_rope = apply_rotary_pos_emb(
-            q_shared, k_shared, pe_freqs_cis
-        )
-
-        # mask is (B, L_all, L_all), needs to be (B, H, L_all, L_all) or (B, 1, L_all, L_all) for SDPA
-        # flow math.attention takes mask (B, H, L, D) - actually (B,H,L_q, L_k)
-        # The mask from model.forward is (B, H, L_all, L_all)
-        # My current txt_img_mask is (B, L_all, L_all) - need to unsqueeze for heads
-        sdpa_mask = (
-            mask.unsqueeze(1) if mask is not None else None
-        )  # (B, 1, L_all, L_all)
-
-        attn_shared_out_raw = F.scaled_dot_product_attention(
-            q_shared_rope,
-            k_shared_rope,
-            v_shared,
-            attn_mask=sdpa_mask,
-            scale=self.scale,
-        )  # Use self.scale if not built into SDPA
-        # Default SDPA scale is (1/sqrt(d_k)). If custom scale is needed, it should be passed.
-        # Flow's self.scale is head_dim**-0.5. Default SDPA uses this.
-
-        attn_shared_out_flat = rearrange(attn_shared_out_raw, "b h l d -> b l (h d)")
-        attn_shared_projected = self.shared_out_proj(attn_shared_out_flat)
-
-        L_txt = txt_embeds.shape[1]
-        txt_attn_res = attn_shared_projected[:, :L_txt, :]
-        img_attn_res = attn_shared_projected[:, L_txt:, :]
-
-        # Image Path (continued)
-        img_embeds = img_embeds + img_mod_attn.gate.squeeze(1) * img_attn_res
-        img_norm2_out = self.img_norm2(img_embeds)
-        img_modulated_mlp = self._modulate(img_norm2_out, img_mod_mlp)
-        img_mlp_processed = self.img_mlp(img_modulated_mlp)
-        img_embeds = img_embeds + img_mod_mlp.gate.squeeze(1) * img_mlp_processed
-
-        # Text Path (continued)
+        txt_modulated_attn_in = self._modulate(txt_norm1_out, txt_mod_attn)
+        txt_attn_res = self.txt_attn(txt_modulated_attn_in, pe_freqs_cis_txt, mask_txt)
         txt_embeds = txt_embeds + txt_mod_attn.gate.squeeze(1) * txt_attn_res
+
         txt_norm2_out = self.txt_norm2(txt_embeds)
-        txt_modulated_mlp = self._modulate(txt_norm2_out, txt_mod_mlp)
-        txt_mlp_processed = self.txt_mlp(txt_modulated_mlp)
+        txt_modulated_mlp_in = self._modulate(txt_norm2_out, txt_mod_mlp)
+        txt_mlp_processed = self.txt_mlp(txt_modulated_mlp_in)
         txt_embeds = txt_embeds + txt_mod_mlp.gate.squeeze(1) * txt_mlp_processed
 
         return img_embeds, txt_embeds
@@ -660,7 +609,7 @@ class ChromaSingleStreamBlock(nn.Module):
         self.pre_norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.linear1 = nn.Linear(dim, dim * 3 + mlp_hidden_dim, bias=True)
 
-        self.qk_norm = RMSNorm(
+        self.norm = RMSNorm(
             head_dim, eps=1e-6
         )  # flow.SingleStreamBlock.norm is QKNorm(head_dim)
         # so it applies to Q and K separately.
@@ -694,10 +643,10 @@ class ChromaSingleStreamBlock(nn.Module):
         qkv_fused, mlp_in_val = torch.split(
             self.linear1(x_mod),
             [
-                3 * self.config.num_attention_heads * self.config.attention_head_dim,
+                3 * self.num_heads * self.head_dim,
                 int(
-                    self.config.num_attention_heads
-                    * self.config.attention_head_dim
+                    self.num_heads
+                    * self.head_dim
                     * getattr(self.config, "mlp_ratio", 4.0)
                 ),
             ],
@@ -712,8 +661,8 @@ class ChromaSingleStreamBlock(nn.Module):
             d=self.head_dim,
         ).unbind(dim=0)
 
-        q_norm = self._apply_norm_to_q_or_k(q, self.qk_norm)
-        k_norm = self._apply_norm_to_q_or_k(k, self.qk_norm)
+        q_norm = self._apply_norm_to_q_or_k(q, self.norm)
+        k_norm = self._apply_norm_to_q_or_k(k, self.norm)
 
         q_rope, k_rope = apply_rotary_pos_emb(q_norm, k_norm, pe_freqs_cis)
 
@@ -763,7 +712,13 @@ class ChromaTransformer2DModel(
     ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixin
 ):
     _supports_gradient_checkpointing = True
-    _no_split_modules = ["ChromaDoubleStreamBlock", "ChromaSingleStreamBlock"]
+    _no_split_modules = [
+        "ChromaDoubleStreamBlock",
+        "ChromaSingleStreamBlock",
+        "ChromaSelfAttentionFlow",
+        "QKNorm",
+        "MLPEmbedder",
+    ]
     _skip_layerwise_casting_patterns = [
         "pe_embedder",
         "norm_final",
@@ -777,25 +732,25 @@ class ChromaTransformer2DModel(
     @register_to_config
     def __init__(
         self,
-        patch_size: int = 2,  # From FLUX paper for VAE, Chroma uses this logic
-        in_channels: int = 64,
-        out_channels: Optional[int] = 64,
-        num_layers: int = 19,
-        num_single_layers: int = 38,
+        patch_size: int = 1,  # This is distinct from VAE patch_size for Chroma's LastLayer
+        in_channels: int = 64,  # Patched VAE latent channels
+        out_channels: Optional[
+            int
+        ] = 64,  # Output channels matching in_channels for latents
+        num_layers: int = 19,  # Corresponds to depth of DoubleStreamBlocks
+        num_single_layers: int = 38,  # Corresponds to depth_single_blocks
         attention_head_dim: int = 128,
         num_attention_heads: int = 24,
-        joint_attention_dim: int = 4096,
-        guidance_embeds: bool = True,
-        axes_dims_rope: Tuple[int, ...] = (16, 56, 56),  # Made it Tuple[int, ...]
+        joint_attention_dim: int = 4096,  # Input dim for text embeddings
+        guidance_embeds: bool = True,  # Flag, actual guidance scalar used in Approximator
+        axes_dims_rope: Tuple[int, ...] = (16, 56, 56),
         mod_index_length: int = 344,
         approximator_in_dim_feature_splits: Tuple[int, int, int] = (16, 16, 32),
         approximator_depth: int = 5,
         approximator_hidden_size: int = 5120,
         rope_theta: int = 10000,
-        qkv_bias: bool = True,
+        qkv_bias: bool = True,  # Bias for QKV projections in attention
         mlp_ratio: float = 4.0,
-        # pooled_projection_dim is not in flow.ChromaParams, so removed from __init__
-        # It was part of FluxTransformer2DModel for CLIP pooled embeds.
     ):
         super().__init__()
         self.hidden_size = num_attention_heads * attention_head_dim
@@ -968,6 +923,12 @@ class ChromaTransformer2DModel(
 
         return output_mask
 
+    def _get_image_self_attention_mask(
+        self, batch_size: int, seq_len_img: int, device: torch.device
+    ) -> torch.Tensor:
+        # Image tokens attend to all other image tokens
+        return torch.zeros(batch_size, 1, seq_len_img, seq_len_img, device=device)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1117,9 +1078,8 @@ class ChromaTransformer2DModel(
                 img_embeds, txt_embeds = block(
                     img_embeds,
                     txt_embeds,
-                    pe_freqs_cis=pe_freqs_cis,
-                    mod_dict_entry=current_mod_entry,
-                    mask=txt_img_mask_for_sdpa,
+                    pe_freqs_cis,
+                    txt_img_mask_for_sdpa,
                 )
 
         merged_embeds = torch.cat((txt_embeds, img_embeds), dim=1)
