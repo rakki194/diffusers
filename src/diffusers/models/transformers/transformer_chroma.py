@@ -60,7 +60,7 @@ class ModulationOut:
     gate: Optional[torch.Tensor] = None
 
 
-def timestep_embedding(
+def chroma_timestep_embedding(
     timesteps: torch.Tensor,
     embed_dim: int,
     max_period: int = 10000,
@@ -361,23 +361,20 @@ class ChromaSelfAttention(nn.Module):
 
 
 # Placeholders for MLPEmbedder, Approximator, Blocks, LastLayer, and Main Model
-class ChromaMLPEmbedder(nn.Module):
+class MLPEmbedder(nn.Module):
     def __init__(
-        self, in_dim, hidden_dim, out_dim, act=nn.SiLU()
-    ):  # flow uses SiLU in MLPEmbedder
+        self, in_dim: int, hidden_dim: int, out_dim: Optional[int] = None, act_fn=None
+    ):
         super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim), act, nn.Linear(hidden_dim, out_dim)
-        )
-        self.norm = RMSNorm(
-            in_dim
-        )  # flow.Approximator.MLPEmbedder uses RMSNorm before MLP
+        self.act = nn.SiLU() if act_fn is None else act_fn
+        out_dim_eff = (
+            out_dim if out_dim is not None else hidden_dim
+        )  # Effective out_dim
+        self.in_layer = nn.Linear(in_dim, hidden_dim)
+        self.out_layer = nn.Linear(hidden_dim, out_dim_eff)
 
-    def forward(self, x):  # flow.Approximator uses residual: x = x + layer(norm(x))
-        # The nn.Sequential in flow.Approximator's MLPEmbedder IS the layer(norm(x)) part.
-        # The residual is in the loop of Approximator.
-        # So, this should be: norm -> mlp
-        return self.mlp(self.norm(x))
+    def forward(self, x):
+        return self.out_layer(self.act(self.in_layer(x)))
 
 
 class ChromaApproximator(nn.Module):
@@ -393,50 +390,18 @@ class ChromaApproximator(nn.Module):
         self.in_proj = nn.Linear(
             self.in_dim_approximator, self.hidden_size_approximator, bias=True
         )
-
-        self.layers = nn.ModuleList()
-        self.norms = nn.ModuleList()  # Paired norms for each MLPEmbedder layer
-        for _ in range(config.approximator_depth):
-            # In flow.Approximator: layers.append(MLPEmbedder(hidden_dim, hidden_dim))
-            # norms.append(RMSNorm(hidden_dim))
-            # And forward is: x = x + layer(norm(x))
-            # So, ChromaMLPEmbedder should take hidden_dim as input AND output.
-            self.layers.append(
-                ChromaMLPEmbedder(
+        # `layers` (ModuleList of MLPEmbedder) and `norms` (ModuleList of RMSNorm)
+        self.layers = nn.ModuleList(
+            [
+                MLPEmbedder(
                     self.hidden_size_approximator,
                     self.hidden_size_approximator,
                     self.hidden_size_approximator,
                 )
-            )  # flow.MLPEmbedder does in->hidden, hidden->hidden
-            # It seems ChromaMLPEmbedder is just the MLP part after norm.
-        # Revisit ChromaMLPEmbedder and flow.Approximator.forward:
-        # flow.Approximator:
-        # self.layers = nn.ModuleList([MLPEmbedder(hidden_dim, hidden_dim) for x in range(n_layers)])
-        # self.norms = nn.ModuleList([RMSNorm(hidden_dim) for x in range(n_layers)])
-        # forward: x = self.in_proj(x); for layer, norm in zip(self.layers, self.norms): x = x + layer(norm(x))
-        # And flow.MLPEmbedder is: Linear(in,hid) -> SiLU -> Linear(hid,hid) (NO NORM INSIDE)
-        # So our ChromaMLPEmbedder was wrong. It should not have a norm.
-        # The norm is applied BEFORE calling the MLPEmbedder in Approximator's loop.
-
-        # Corrected Approximator structure:
-        self.layers_mlp = (
-            nn.ModuleList()
-        )  # Renamed to avoid confusion with self.layers in this scope
-        for _ in range(config.approximator_depth):
-            # flow.MLPEmbedder: in_layer(in, hid), silu, out_layer(hid, hid)
-            # Here, input to MLPEmbedder is hidden_size_approximator
-            self.layers_mlp.append(
-                nn.Sequential(
-                    nn.Linear(
-                        self.hidden_size_approximator, self.hidden_size_approximator
-                    ),
-                    nn.SiLU(),
-                    nn.Linear(
-                        self.hidden_size_approximator, self.hidden_size_approximator
-                    ),
-                )
-            )
-        self.norms_approx = nn.ModuleList(
+                for _ in range(config.approximator_depth)
+            ]
+        )
+        self.norms = nn.ModuleList(
             [
                 RMSNorm(self.hidden_size_approximator)
                 for _ in range(config.approximator_depth)
@@ -447,48 +412,93 @@ class ChromaApproximator(nn.Module):
         )
 
     def forward(self, timestep, guidance, mod_indices_tensor_placeholder=None):
-        # mod_indices_tensor_placeholder is not used, fixed_mod_indices are generated internally
-
         ts_embed_dim, guidance_embed_dim, mod_idx_embed_dim_cfg = (
             self.config.approximator_in_dim_feature_splits
         )
-
-        distill_timestep = timestep_embedding(timestep, ts_embed_dim, time_factor=1.0)
-        distill_guidance = timestep_embedding(
+        distill_timestep = chroma_timestep_embedding(
+            timestep, ts_embed_dim, time_factor=1.0
+        )
+        distill_guidance = chroma_timestep_embedding(
             guidance, guidance_embed_dim, time_factor=1.0
         )
 
         batch_size = timestep.shape[0]
         mod_len = self.config.mod_index_length
-
-        fixed_mod_indices = torch.arange(
-            self.config.mod_index_length, device=timestep.device
-        )
-        modulation_index_embedded = timestep_embedding(
+        fixed_mod_indices = torch.arange(mod_len, device=timestep.device)
+        modulation_index_embedded = chroma_timestep_embedding(
             fixed_mod_indices, mod_idx_embed_dim_cfg, time_factor=1.0
         )
         modulation_index_batched = modulation_index_embedded.unsqueeze(0).repeat(
             batch_size, 1, 1
         )
-
         timestep_guidance_embed = torch.cat([distill_timestep, distill_guidance], dim=1)
         timestep_guidance_embed_repeated = timestep_guidance_embed.unsqueeze(1).repeat(
             1, mod_len, 1
         )
-
         x = torch.cat(
             [timestep_guidance_embed_repeated, modulation_index_batched], dim=-1
         )
-
-        # Approximator MLP structure from flow.module.layers.Approximator
         x = self.in_proj(x)
-        for layer_mlp_module, norm_module in zip(self.layers_mlp, self.norms_approx):
-            x = x + layer_mlp_module(
-                norm_module(x)
-            )  # Residual connection around norm -> mlp_block
+        for layer_module, norm_module in zip(self.layers, self.norms):
+            x_normed = norm_module(x)
+            x = x + layer_module(x_normed)  # Residual connection: x + MLP(norm(x))
         x = self.out_proj(x)
-
         return x
+
+
+class QKNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.query_norm = RMSNorm(dim, eps=eps)
+        self.key_norm = RMSNorm(dim, eps=eps)
+
+    def forward(
+        self, q: torch.Tensor, k: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.query_norm(q), self.key_norm(k)
+
+
+class ChromaSelfAttentionFlow(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        head_dim: int,
+        qkv_bias: bool = True,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.scale = head_dim**-0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)  # Combined QKV projection
+        self.norm = QKNorm(head_dim, eps=eps)  # QKNorm for query and key
+        self.proj = nn.Linear(dim, dim)  # Output projection
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        pe_freqs_cis_stream: torch.Tensor,
+        mask_stream: Optional[torch.Tensor] = None,
+    ):
+        qkv_val = self.qkv(x)
+        q, k, v = rearrange(
+            qkv_val,
+            "b l (three h d) -> three b h l d",
+            three=3,
+            h=self.num_heads,
+            d=self.head_dim,
+        ).unbind(0)
+
+        q_normed, k_normed = self.norm(q, k)
+        q_rope, k_rope = apply_rotary_pos_emb(q_normed, k_normed, pe_freqs_cis_stream)
+
+        attn_out_raw = F.scaled_dot_product_attention(
+            q_rope, k_rope, v, attn_mask=mask_stream, scale=self.scale
+        )
+        attn_out_flat = rearrange(attn_out_raw, "b h l d -> b l (h d)")
+        return self.proj(attn_out_flat)
 
 
 class ChromaDoubleStreamBlock(nn.Module):
@@ -498,19 +508,13 @@ class ChromaDoubleStreamBlock(nn.Module):
         dim = config.num_attention_heads * config.attention_head_dim
         num_heads = config.num_attention_heads
         head_dim = config.attention_head_dim
-        # mlp_ratio from config, defaulting if not present
         mlp_ratio = getattr(config, "mlp_ratio", 4.0)
         mlp_hidden_dim = int(dim * mlp_ratio)
         qkv_bias = getattr(config, "qkv_bias", True)
 
-        # Image Stream Components (matching flow.DoubleStreamBlock)
         self.img_norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        # flow.SelfAttention: qkv=Linear, norm=QKNorm(RMS), proj=Linear
-        # Our ChromaSelfAttention has q_proj, k_proj, v_proj, out_proj and norm_q, norm_k (RMS)
-        # We need to make sure this maps correctly.
-        # flow.DoubleStreamBlock creates img_qkv, then img_q,k,v, then norms q,k with SelfAttention.norm
-        self.img_attn = ChromaSelfAttention(
-            dim, num_heads, head_dim, qk_norm=True, eps=1e-6
+        self.img_attn = ChromaSelfAttentionFlow(
+            dim, num_heads, head_dim, qkv_bias=qkv_bias, eps=1e-6
         )
         self.img_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.img_mlp = nn.Sequential(
@@ -519,10 +523,9 @@ class ChromaDoubleStreamBlock(nn.Module):
             nn.Linear(mlp_hidden_dim, dim, bias=True),
         )
 
-        # Text Stream Components
         self.txt_norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.txt_attn = ChromaSelfAttention(
-            dim, num_heads, head_dim, qk_norm=True, eps=1e-6
+        self.txt_attn = ChromaSelfAttentionFlow(
+            dim, num_heads, head_dim, qkv_bias=qkv_bias, eps=1e-6
         )
         self.txt_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.txt_mlp = nn.Sequential(
@@ -531,30 +534,8 @@ class ChromaDoubleStreamBlock(nn.Module):
             nn.Linear(mlp_hidden_dim, dim, bias=True),
         )
 
-        # Shared attention output projection (qkv derived from streams, normed, RoPE'd, then scaled_dot_product)
-        # The shared attention in flow doesn't have its own QKV projections. It uses Q,K,V from streams.
-        # It only needs an output projection.
-        self.shared_out_proj = nn.Linear(
-            dim, dim
-        )  # Corresponds to self.img_attn.proj or self.txt_attn.proj in flow
-        self.num_heads = num_heads
-        self.head_dim = head_dim
-        self.scale = head_dim**-0.5
-
     def _modulate(self, x, mod: ModulationOut):
-        return (1 + mod.scale.squeeze(1)) * x + mod.shift.squeeze(
-            1
-        )  # Squeeze B,1,D to B,D for LayerNorm compat if needed
-
-    def _apply_norm_to_q_or_k(self, q_or_k_tensor: torch.Tensor, norm_layer: RMSNorm):
-        # q_or_k_tensor: (B, H, L, D_head)
-        # norm_layer: RMSNorm(D_head)
-        b, h, l, d = q_or_k_tensor.shape
-        orig_dtype = q_or_k_tensor.dtype
-        # Reshape for norm: (B*H*L, D_head)
-        reshaped_tensor = q_or_k_tensor.reshape(-1, d)
-        normed_tensor = norm_layer(reshaped_tensor)
-        return normed_tensor.reshape(b, h, l, d).to(orig_dtype)
+        return (1 + mod.scale) * x + mod.shift
 
     def forward(
         self,
@@ -566,30 +547,30 @@ class ChromaDoubleStreamBlock(nn.Module):
         mask_img,
         mask_txt,
     ):
-        img_mod_attn, img_mod_mlp = mod_dict_entry["img_mod.lin"]
-        txt_mod_attn, txt_mod_mlp = mod_dict_entry["txt_mod.lin"]
+        img_mod_list = mod_dict_entry["img_mod.lin"]
+        txt_mod_list = mod_dict_entry["txt_mod.lin"]
+        img_mod_attn, img_mod_mlp = img_mod_list[0], img_mod_list[1]
+        txt_mod_attn, txt_mod_mlp = txt_mod_list[0], txt_mod_list[1]
 
-        # Image Path - QKV generation and Norm
         img_norm1_out = self.img_norm1(img_embeds)
         img_modulated_attn_in = self._modulate(img_norm1_out, img_mod_attn)
         img_attn_res = self.img_attn(img_modulated_attn_in, pe_freqs_cis_img, mask_img)
-        img_embeds = img_embeds + img_mod_attn.gate.squeeze(1) * img_attn_res
+        img_embeds = img_embeds + img_mod_attn.gate * img_attn_res
 
         img_norm2_out = self.img_norm2(img_embeds)
         img_modulated_mlp_in = self._modulate(img_norm2_out, img_mod_mlp)
         img_mlp_processed = self.img_mlp(img_modulated_mlp_in)
-        img_embeds = img_embeds + img_mod_mlp.gate.squeeze(1) * img_mlp_processed
+        img_embeds = img_embeds + img_mod_mlp.gate * img_mlp_processed
 
-        # Text Path - QKV generation and Norm
         txt_norm1_out = self.txt_norm1(txt_embeds)
         txt_modulated_attn_in = self._modulate(txt_norm1_out, txt_mod_attn)
         txt_attn_res = self.txt_attn(txt_modulated_attn_in, pe_freqs_cis_txt, mask_txt)
-        txt_embeds = txt_embeds + txt_mod_attn.gate.squeeze(1) * txt_attn_res
+        txt_embeds = txt_embeds + txt_mod_attn.gate * txt_attn_res
 
         txt_norm2_out = self.txt_norm2(txt_embeds)
         txt_modulated_mlp_in = self._modulate(txt_norm2_out, txt_mod_mlp)
         txt_mlp_processed = self.txt_mlp(txt_modulated_mlp_in)
-        txt_embeds = txt_embeds + txt_mod_mlp.gate.squeeze(1) * txt_mlp_processed
+        txt_embeds = txt_embeds + txt_mod_mlp.gate * txt_mlp_processed
 
         return img_embeds, txt_embeds
 
@@ -599,56 +580,33 @@ class ChromaSingleStreamBlock(nn.Module):
         super().__init__()
         self.config = config
         dim = config.num_attention_heads * config.attention_head_dim
-        num_heads = config.num_attention_heads
-        head_dim = config.attention_head_dim
+        self.num_heads = config.num_attention_heads
+        self.head_dim = config.attention_head_dim
         mlp_ratio = getattr(config, "mlp_ratio", 4.0)
-        mlp_hidden_dim = int(dim * mlp_ratio)
-        # qkv_bias for linear1? flow.SingleStreamBlock.linear1 does not show bias param
-        # but nn.Linear defaults to bias=True. Let's assume True for now.
+        self.mlp_hidden_dim = int(dim * mlp_ratio)
+        qkv_bias = getattr(config, "qkv_bias", True)
 
         self.pre_norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.linear1 = nn.Linear(dim, dim * 3 + mlp_hidden_dim, bias=True)
-
-        self.norm = RMSNorm(
-            head_dim, eps=1e-6
-        )  # flow.SingleStreamBlock.norm is QKNorm(head_dim)
-        # so it applies to Q and K separately.
-
+        self.linear1 = nn.Linear(dim, dim * 3 + self.mlp_hidden_dim, bias=qkv_bias)
+        self.norm = QKNorm(self.head_dim, eps=1e-6)
         self.mlp_act = nn.GELU(approximate="tanh")
-        self.linear2 = nn.Linear(dim + mlp_hidden_dim, dim, bias=True)
+        self.linear2 = nn.Linear(dim + self.mlp_hidden_dim, dim, bias=True)
 
-        self.num_heads = num_heads
-        self.head_dim = head_dim
-        self.scale = head_dim**-0.5
+        self.scale = self.head_dim**-0.5
 
-    def _modulate_pre_norm(
-        self, x, mod: ModulationOut
-    ):  # Only scale and shift for pre_norm
-        return (1 + mod.scale.squeeze(1)) * x + mod.shift.squeeze(1)
-
-    def _apply_norm_to_q_or_k(self, q_or_k_tensor: torch.Tensor, norm_layer: RMSNorm):
-        b, h, l, d = q_or_k_tensor.shape
-        orig_dtype = q_or_k_tensor.dtype
-        reshaped_tensor = q_or_k_tensor.reshape(-1, d)
-        normed_tensor = norm_layer(reshaped_tensor)
-        return normed_tensor.reshape(b, h, l, d).to(orig_dtype)
+    def _modulate_pre_norm(self, x, mod: ModulationOut):
+        return (1 + mod.scale) * x + mod.shift
 
     def forward(self, x, pe_freqs_cis, mod_single: ModulationOut, mask):
         residual = x
-
         norm_out = self.pre_norm(x)
-        # mod_single has scale, shift, gate. Squeeze the (B,1,D) to (B,D) if needed by LayerNorm
         x_mod = self._modulate_pre_norm(norm_out, mod_single)
 
         qkv_fused, mlp_in_val = torch.split(
             self.linear1(x_mod),
             [
                 3 * self.num_heads * self.head_dim,
-                int(
-                    self.num_heads
-                    * self.head_dim
-                    * getattr(self.config, "mlp_ratio", 4.0)
-                ),
+                self.mlp_hidden_dim,
             ],
             dim=-1,
         )
@@ -661,23 +619,18 @@ class ChromaSingleStreamBlock(nn.Module):
             d=self.head_dim,
         ).unbind(dim=0)
 
-        q_norm = self._apply_norm_to_q_or_k(q, self.norm)
-        k_norm = self._apply_norm_to_q_or_k(k, self.norm)
-
+        q_norm, k_norm = self.norm(q, k)
         q_rope, k_rope = apply_rotary_pos_emb(q_norm, k_norm, pe_freqs_cis)
 
-        sdpa_mask = mask.unsqueeze(1) if mask is not None else None
         attn_out_raw = F.scaled_dot_product_attention(
-            q_rope, k_rope, v, attn_mask=sdpa_mask, scale=self.scale
+            q_rope, k_rope, v, attn_mask=mask, scale=self.scale
         )
         attn_out = rearrange(attn_out_raw, "b h l d -> b l (h d)")
-
         mlp_act_out = self.mlp_act(mlp_in_val)
-
         combined_features = torch.cat((attn_out, mlp_act_out), dim=-1)
         block_output_val = self.linear2(combined_features)
 
-        x = residual + mod_single.gate.squeeze(1) * block_output_val  # Squeeze gate mod
+        x = residual + mod_single.gate * block_output_val
         return x
 
 
@@ -686,22 +639,16 @@ class ChromaLastLayer(nn.Module):
         super().__init__()
         self.config = config
         hidden_size = config.num_attention_heads * config.attention_head_dim
-        out_channels = (
-            config.out_channels
-        )  # This is model's direct output channels (e.g., 64)
+        out_channels = config.out_channels
 
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.linear = nn.Linear(
-            hidden_size, out_channels, bias=True
-        )  # flow.LastLayer has bias=True for linear
+        self.linear = nn.Linear(hidden_size, out_channels, bias=True)
 
-    def _modulate(self, x, shift, scale):  # No gate for LastLayer mod
-        # shift, scale are (B, 1, D), need to be (B, D) or broadcastable with x (B,L,D)
-        return (1 + scale.squeeze(1)) * x + shift.squeeze(1)
+    def _modulate(self, x, shift, scale):
+        return (1 + scale) * x + shift
 
     def forward(self, x, mod_final_list: List[torch.Tensor]):
         shift, scale = mod_final_list[0], mod_final_list[1]
-
         norm_out = self.norm_final(x)
         x_mod = self._modulate(norm_out, shift, scale)
         return self.linear(x_mod)
